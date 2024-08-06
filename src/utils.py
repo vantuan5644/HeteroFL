@@ -100,7 +100,7 @@ def recur(fn, input, *args):
 def process_dataset(dataset):
     if cfg['data_name'] in ['MNIST', 'CIFAR10']:
         cfg['classes_size'] = dataset['train'].classes_size
-    elif cfg['data_name'] in ['WikiText2']:
+    elif cfg['data_name'] in ['WikiText2', 'WikiText103', 'PennTreebank']:
         cfg['vocab'] = dataset['train'].vocab
         cfg['num_tokens'] = len(dataset['train'].vocab)
         for split in dataset:

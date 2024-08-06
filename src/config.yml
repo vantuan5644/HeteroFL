@@ -14,8 +14,8 @@ control:
 data_name: CIFAR10
 subset: label
 batch_size:
-  train: 128
-  test: 128
+  train: 512
+  test: 512
 shuffle:
   train: True
   test: False
