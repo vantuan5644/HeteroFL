@@ -3,19 +3,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .utils import init_param
-from torch.nn import TransformerEncoder
+
+# from torch.nn import TransformerEncoder
 from config import cfg
 from modules import Scaler
+import copy
+from typing import Optional, Any
+
+import torch
+from torch import Tensor
 
 
 class PositionalEmbedding(nn.Module):
     def __init__(self, embedding_size):
         super().__init__()
-        self.positional_embedding = nn.Embedding(cfg['bptt'], embedding_size)
+        self.positional_embedding = nn.Embedding(cfg["bptt"], embedding_size)
 
     def forward(self, x):
         N, S = x.size()
-        position = torch.arange(S, dtype=torch.long, device=x.device).unsqueeze(0).expand((N, S))
+        position = (
+            torch.arange(S, dtype=torch.long, device=x.device)
+            .unsqueeze(0)
+            .expand((N, S))
+        )
         x = self.positional_embedding(position)
         return x
 
@@ -32,9 +42,77 @@ class TransformerEmbedding(nn.Module):
         self.scaler = Scaler(rate)
 
     def forward(self, src):
-        src = self.scaler(self.embedding(src)) + self.scaler(self.positional_embedding(src))
+        src = self.scaler(self.embedding(src)) + self.scaler(
+            self.positional_embedding(src)
+        )
         src = self.dropout(self.norm(src))
         return src
+
+
+class TransformerEncoder(nn.Module):
+    r"""TransformerEncoder is a stack of N encoder layers
+
+    Args:
+        encoder_layer: an instance of the TransformerEncoderLayer() class (required).
+        num_layers: the number of sub-encoder-layers in the encoder (required).
+        norm: the layer normalization component (optional).
+
+    Examples::
+        >>> encoder_layer = nn.TransformerEncoderLayer(d_model=512, nhead=8)
+        >>> transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=6)
+        >>> src = torch.rand(10, 32, 512)
+        >>> out = transformer_encoder(src)
+    """
+
+    __constants__ = ["norm"]
+
+    def __init__(self, encoder_layer, num_layers, norm=None):
+        super(TransformerEncoder, self).__init__()
+        self.layers = _get_clones(encoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+
+    def forward(
+        self,
+        src: Tensor,
+        mask: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        r"""Pass the input through the encoder layers in turn.
+
+        Args:
+            src: the sequence to the encoder (required).
+            mask: the mask for the src sequence (optional).
+            src_key_padding_mask: the mask for the src keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        output = src
+
+        for mod in self.layers:
+            output = mod(
+                output, src_mask=mask, src_key_padding_mask=src_key_padding_mask
+            )
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        return output
+
+
+def _get_clones(module, N):
+    from torch.nn.modules.container import ModuleList
+    return ModuleList([copy.deepcopy(module) for i in range(N)])
+
+
+def _get_activation_fn(activation):
+    if activation == "relu":
+        return F.relu
+    elif activation == "gelu":
+        return F.gelu
+
+    raise RuntimeError("activation should be relu/gelu, not {}".format(activation))
 
 
 class ScaledDotProduct(nn.Module):
@@ -45,7 +123,7 @@ class ScaledDotProduct(nn.Module):
     def forward(self, q, k, v, mask=None):
         scores = q.matmul(k.transpose(-2, -1)) / self.temperature
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            scores = scores.masked_fill(mask == 0, float("-inf"))
         attn = F.softmax(scores, dim=-1)
         output = torch.matmul(attn, v)
         return output, attn
@@ -60,25 +138,41 @@ class MultiheadAttention(nn.Module):
         self.linear_k = nn.Linear(embedding_size, embedding_size)
         self.linear_v = nn.Linear(embedding_size, embedding_size)
         self.linear_o = nn.Linear(embedding_size, embedding_size)
-        self.attention = ScaledDotProduct(temperature=(embedding_size // num_heads) ** 0.5)
+        self.attention = ScaledDotProduct(
+            temperature=(embedding_size // num_heads) ** 0.5
+        )
         self.scaler = Scaler(rate)
 
     def _reshape_to_batches(self, x):
         batch_size, seq_len, in_feature = x.size()
         sub_dim = in_feature // self.num_heads
-        return x.reshape(batch_size, seq_len, self.num_heads, sub_dim).permute(0, 2, 1, 3) \
+        return (
+            x.reshape(batch_size, seq_len, self.num_heads, sub_dim)
+            .permute(0, 2, 1, 3)
             .reshape(batch_size * self.num_heads, seq_len, sub_dim)
+        )
 
     def _reshape_from_batches(self, x):
         batch_size, seq_len, in_feature = x.size()
         batch_size //= self.num_heads
         out_dim = in_feature * self.num_heads
-        return x.reshape(batch_size, self.num_heads, seq_len, in_feature).permute(0, 2, 1, 3) \
+        return (
+            x.reshape(batch_size, self.num_heads, seq_len, in_feature)
+            .permute(0, 2, 1, 3)
             .reshape(batch_size, seq_len, out_dim)
+        )
 
     def forward(self, q, k, v, mask=None):
-        q, k, v = self.scaler(self.linear_q(q)), self.scaler(self.linear_k(k)), self.scaler(self.linear_v(v))
-        q, k, v = self._reshape_to_batches(q), self._reshape_to_batches(k), self._reshape_to_batches(v)
+        q, k, v = (
+            self.scaler(self.linear_q(q)),
+            self.scaler(self.linear_k(k)),
+            self.scaler(self.linear_v(v)),
+        )
+        q, k, v = (
+            self._reshape_to_batches(q),
+            self._reshape_to_batches(k),
+            self._reshape_to_batches(v),
+        )
         q, attn = self.attention(q, k, v, mask)
         q = self._reshape_from_batches(q)
         q = self.scaler(self.linear_o(q))
@@ -113,7 +207,9 @@ class TransformerEncoderLayer(nn.Module):
         attn_output, _ = self.mha(src, src, src, mask=src_mask)
         src = src + self.dropout(attn_output)
         src = self.norm1(src)
-        src2 = self.scaler(self.linear2(self.dropout1(self.activation(self.scaler(self.linear1(src))))))
+        src2 = self.scaler(
+            self.linear2(self.dropout1(self.activation(self.scaler(self.linear1(src)))))
+        )
         src = src + self.dropout2(src2)
         src = self.norm2(src)
         return src
@@ -134,42 +230,63 @@ class Decoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, num_tokens, embedding_size, num_heads, hidden_size, num_layers, dropout, rate):
+    def __init__(
+        self,
+        num_tokens,
+        embedding_size,
+        num_heads,
+        hidden_size,
+        num_layers,
+        dropout,
+        rate,
+    ):
         super().__init__()
         self.num_tokens = num_tokens
-        self.transformer_embedding = TransformerEmbedding(num_tokens, embedding_size, dropout, rate)
-        encoder_layers = TransformerEncoderLayer(embedding_size, num_heads, hidden_size, dropout, rate)
+        self.transformer_embedding = TransformerEmbedding(
+            num_tokens, embedding_size, dropout, rate
+        )
+        encoder_layers = TransformerEncoderLayer(
+            embedding_size, num_heads, hidden_size, dropout, rate
+        )
         self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers)
         self.decoder = Decoder(num_tokens, embedding_size, rate)
 
     def forward(self, input):
         output = {}
-        src = input['label'].clone()
+        src = input["label"].clone()
         N, S = src.size()
-        d = torch.distributions.bernoulli.Bernoulli(probs=cfg['mask_rate'])
+        d = torch.distributions.bernoulli.Bernoulli(probs=cfg["mask_rate"])
         mask = d.sample((N, S)).to(src.device)
         src = src.masked_fill(mask == 1, self.num_tokens).detach()
         src = self.transformer_embedding(src)
         src = self.transformer_encoder(src)
         out = self.decoder(src)
         out = out.permute(0, 2, 1)
-        if 'label_split' in input and cfg['mask']:
-            label_mask = torch.zeros((cfg['num_tokens'], 1), device=out.device)
-            label_mask[input['label_split']] = 1
+        if "label_split" in input and cfg["mask"]:
+            label_mask = torch.zeros((cfg["num_tokens"], 1), device=out.device)
+            label_mask[input["label_split"]] = 1
             out = out.masked_fill(label_mask == 0, 0)
-        output['score'] = out
-        output['loss'] = F.cross_entropy(output['score'], input['label'])
+        output["score"] = out
+        output["loss"] = F.cross_entropy(output["score"], input["label"])
         return output
 
 
 def transformer(model_rate=1):
-    num_tokens = cfg['num_tokens']
-    embedding_size = int(np.ceil(model_rate * cfg['transformer']['embedding_size']))
-    num_heads = cfg['transformer']['num_heads']
-    hidden_size = int(np.ceil(model_rate * cfg['transformer']['hidden_size']))
-    num_layers = cfg['transformer']['num_layers']
-    dropout = cfg['transformer']['dropout']
-    scaler_rate = model_rate / cfg['global_model_rate']
-    model = Transformer(num_tokens, embedding_size, num_heads, hidden_size, num_layers, dropout, scaler_rate)
+    num_tokens = cfg["num_tokens"]
+    embedding_size = int(np.ceil(model_rate * cfg["transformer"]["embedding_size"]))
+    num_heads = cfg["transformer"]["num_heads"]
+    hidden_size = int(np.ceil(model_rate * cfg["transformer"]["hidden_size"]))
+    num_layers = cfg["transformer"]["num_layers"]
+    dropout = cfg["transformer"]["dropout"]
+    scaler_rate = model_rate / cfg["global_model_rate"]
+    model = Transformer(
+        num_tokens,
+        embedding_size,
+        num_heads,
+        hidden_size,
+        num_layers,
+        dropout,
+        scaler_rate,
+    )
     model.apply(init_param)
     return model
